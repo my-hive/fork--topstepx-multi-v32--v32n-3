@@ -1,99 +1,127 @@
-"""v32n-3 exp2: quiet-morning directional breakout + chandelier trail (micros).
+"""v32n-3 exp3: quiet-open afternoon range-expansion breakout ladder (equity micros).
 
-Hypothesis (1-min CME dev screen, 2010-2023, MES/MGC): sessions whose first 30
-RTH minutes print an unusually narrow cash range (pilot < VOBP*price) while
-their close sits on one side of the prior RTH close tend to drift that side
-through midday (VWAP-band continuation earlier measured strongest). Capture via
-6-bar breakout entries 10:00-13:59 while rolling 60-bar range stays compressed;
-chandelier trail at sHA*price per contract gives the declared protective stop
-dollars; time stop 14:00 CT. Fills = next-minute opens per evaluator contract.
+Economic idea: a compressed 09:30-10:29 CT opening range (OR width < QUIET x
+price) on equity index micros, broken after 10:29 by a close beyond OR +/- 15%
+of OR width, defines the day's directional pressure from late-positioned
+participants; add ladder steps 25% of OR further against that pressure with
+protective stops at OR mid and a 3x trailing 30-bar-range chandelier; flat
+after 15:03 CT decisions.
 
-Causality: decision at bar p uses bar p and earlier only; prev close = prior
-session's final close. Constants frozen a priori; micros only; N micros sized
-N*stop_dollars <= $300 per entry. No optimization performed on this variant.
+Private next-open fill triage (stressed 2-tick slip + 1.5x fee) ranked this
+family least-bad on MNQ (cost ratio 2.6% of mean daily |OC|/contract; MYM 5.8%,
+M2K 6.7%); this run records honest evaluator numbers for MNQ+MYM+M2K.
+
+Per-entry declared risk: size * stop_dollars <= $300 (RISK0/$200 initial,
+RISK_ADD/$150 per add, six adds max). All decisions causal: bar-close data of
+the current and prior bars only; position targets fill next minute open.
 """
 
 import numpy as np
 
-VOBP = 0.0020   # pilot + 60-bar cash-range gate, fraction of price
-sHA = 0.009     # chandelier stop distance, fraction of price
-BREAK = 6       # breakout lookback in bars
-FAR = 0.008     # skip chase if gap-to-prev-close already exceeds this
+SYMS = {
+    'M2K': {'pv': 5.0, 'quiet': 0.0025, 'nmax': 10},
+    'MYM': {'pv': 0.5, 'quiet': 0.0025, 'nmax': 10},
+    'MNQ': {'pv': 2.0, 'quiet': 0.0025, 'nmax': 10},
+}
+OR_START, OR_END = 34200, 37800     # 09:30 .. 10:29 CT
+BUF = 0.15                          # breakout buffer, fraction of OR width
+RISK0, RISK_ADD = 200.0, 150.0      # per-entry risk budgets ($)
 RISK_CAP = 300.0
-NCAP = 6        # per-symbol micro contracts cap (exposure stays <= 2.4 std eq)
-PV = {'MCL': 100.0, 'MES': 5.0, 'MGC': 10.0, 'MNQ': 2.0}
+EXT_STEP = 0.25                      # add trigger progress, fraction of OR
+ADDS_MAX = 6
+T_LAST = 54240                      # last decision second (15:03 CT)
+CHAND = 3.0                         # chandelier, multiples of trailing r30
 
 
-def _session(hh, ll, cc, ss, prev_close, pv):
-    """One session: per-bar position target (fill next open) + entry risk $/ct."""
-    n = len(ss)
+def _session(h, l, c, sec, pv, quiet, nmax):
+    n = len(sec)
     want = np.zeros(n, dtype=np.int64)
     risk = np.zeros(n)
-    if prev_close is None:
+    i0 = int(np.searchsorted(sec, OR_START))
+    i1 = int(np.searchsorted(sec, OR_END))
+    if i1 + 1 >= n or i1 - i0 < 20:
         return want, risk
-    pilot_lo = pilot_hi = None
-    for p in range(n):
-        if 34200 <= ss[p] < 36000:  # 09:30-09:59 CT opening pilot range
-            pilot_lo = ll[p] if pilot_lo is None else min(pilot_lo, ll[p])
-            pilot_hi = hh[p] if pilot_hi is None else max(pilot_hi, hh[p])
-    if pilot_lo is None or pilot_hi is None or pilot_hi <= pilot_lo:
+    hi = h[i0:i1].max()
+    lo = l[i0:i1].min()
+    mid = 0.5 * (hi + lo)
+    span = hi - lo
+    if span <= 0 or span >= quiet * c[i1]:
         return want, risk
-    pilot = pilot_hi - pilot_lo
-    # vectorized trailing windows (inclusive of current bar; masks handle warmup)
-    r60 = np.full(n, np.inf)
-    if n >= 60:
-        r60[59:] = np.lib.stride_tricks.sliding_window_view(hh, 60).max(axis=1) \
-                 - np.lib.stride_tricks.sliding_window_view(ll, 60).min(axis=1)
-    brk_hi = np.full(n, np.inf)
-    brk_lo = np.full(n, -np.inf)
-    if n > BREAK:
-        brk_hi[BREAK:] = np.lib.stride_tricks.sliding_window_view(hh, BREAK)[:-1].max(axis=1)
-        brk_lo[BREAK:] = np.lib.stride_tricks.sliding_window_view(ll, BREAK)[:-1].min(axis=1)
+    mode = 0
     cur = 0
-    ext = 0.0
-    went = False
-    for p in range(n):
-        if ss[p] < 36000:            # before 10:00 CT: flat, no decisions
+    last_fill = 0.0
+    peak = 0.0
+    trough = 0.0
+    r30 = span / 3.0
+    adds = 0
+    for j in range(i1 + 1, n):
+        t = sec[j]
+        if j >= i1 + 31:
+            r30 = float((h[j - 30:j] - l[j - 30:j]).mean())
+        if t > T_LAST:
+            cur = 0
+            want[j] = 0
             continue
-        if ss[p] >= 50400:           # at/after 14:00 CT: time stop
-            if cur:
-                cur = 0
-                want[p] = 0
+        px = c[j]
+        if mode == 0:
+            stop_px = mid
+            risk_pc = abs(px - stop_px) * pv
+            size = 0
+            if px > hi + BUF * span:
+                mode = 1
+            elif px < lo - BUF * span:
+                mode = -1
+            if mode and RISK_CAP >= risk_pc >= 1e-12 and risk_pc <= RISK0:
+                size = int(RISK0 // risk_pc)
+            if mode and size >= 1:
+                cur = size if mode > 0 else -size
+                if abs(cur) > nmax:
+                    cur = nmax if mode > 0 else -nmax
+                last_fill = px
+                peak, trough = h[j], l[j]
+                adds = 1
+                risk[j] = risk_pc
+            if cur == 0:
+                mode = 0
+            want[j] = cur
             continue
-        if p < 60 or ss[p] - ss[p - 1] != 60:
-            continue                 # warmup or data gap: hold/carry current
-        want[p] = cur
-        px = cc[p]
-        if px <= 0:
-            continue
-        stop_d = sHA * px
-        risk_pc = stop_d * pv
-        if cur == 0 and not went and pilot < VOBP * px and risk_pc <= RISK_CAP:
-            if r60[p] < VOBP * px and abs(px - prev_close) <= FAR * px:
-                size = min(int(RISK_CAP // risk_pc), NCAP)
-                if size >= 1:
-                    if px > prev_close and px > brk_hi[p]:
-                        cur, ext, went = size, px, True
-                        want[p], risk[p] = cur, risk_pc
-                    elif px < prev_close and px < brk_lo[p]:
-                        cur, ext, went = -size, px, True
-                        want[p], risk[p] = cur, risk_pc
-        elif cur > 0:
-            if hh[p] > ext:
-                ext = hh[p]
-            if ll[p] <= ext - stop_d:
+        if mode > 0:
+            peak = max(peak, h[j])
+            stop_px = max(mid, peak - CHAND * r30) if r30 > 0 else mid
+            if l[j] <= stop_px:
                 cur = 0
-                want[p] = 0
-        elif cur < 0:
-            if ll[p] < ext:
-                ext = ll[p]
-            if hh[p] >= ext + stop_d:
+            elif adds < ADDS_MAX and h[j] >= last_fill + EXT_STEP * span:
+                risk_pc = max(px - stop_px, 0.0) * pv
+                if 1e-9 <= risk_pc <= RISK_ADD:
+                    nadd = int(RISK_ADD // risk_pc)
+                    if nadd >= 1:
+                        new = min(cur + nadd, nmax)
+                        if new > cur:
+                            cur = new
+                            last_fill = px
+                            adds += 1
+                            risk[j] = risk_pc
+        else:
+            trough = min(trough, l[j])
+            stop_px = min(mid, trough + CHAND * r30) if r30 > 0 else mid
+            if h[j] >= stop_px:
                 cur = 0
-                want[p] = 0
+            elif adds < ADDS_MAX and l[j] <= last_fill - EXT_STEP * span:
+                risk_pc = max(stop_px - px, 0.0) * pv
+                if 1e-9 <= risk_pc <= RISK_ADD:
+                    nadd = int(RISK_ADD // risk_pc)
+                    if nadd >= 1:
+                        new = max(cur - nadd, -nmax)
+                        if new < cur:
+                            cur = new
+                            last_fill = px
+                            adds += 1
+                            risk[j] = risk_pc
+        want[j] = cur
     return want, risk
 
 
-def _one(df, pv):
+def _one(df, meta):
     h = df.high.to_numpy(float)
     l = df.low.to_numpy(float)
     c = df.close.to_numpy(float)
@@ -101,34 +129,32 @@ def _one(df, pv):
     n = len(df)
     out = np.zeros(n, dtype=np.int64)
     risk = np.zeros(n)
-    prev_close = None
     for wd in df.groupby('session', sort=False).indices.values():
-        rth = (sec[wd] >= 34200) & (sec[wd] < 54600)
-        if prev_close is not None and np.any(rth):
-            idx = wd[rth]
-            w, r = _session(h[idx], l[idx], c[idx], sec[idx], prev_close, pv)
-            if w.size:
-                out[idx] = w
-                risk[idx] = r
-        prev_close = c[wd[-1]]
+        rth = (sec[wd] >= OR_START) & (sec[wd] < 54600)
+        idx = wd[rth]
+        if len(idx) > 30:
+            w, r = _session(h[idx], l[idx], c[idx], sec[idx],
+                           meta['pv'], meta['quiet'], meta['nmax'])
+            out[idx] = w
+            risk[idx] = r
     return out, risk
 
 
 def signals(panel):
-    result = {}
+    out = {}
     for symbol, df in panel.items():
-        if symbol in PV:
-            result[symbol] = _one(df, PV[symbol])[0]
+        if symbol in SYMS:
+            out[symbol] = _one(df, SYMS[symbol])[0]
         else:
-            result[symbol] = np.zeros(len(df), dtype=np.int64)
-    return result
+            out[symbol] = np.zeros(len(df), dtype=np.int64)
+    return out
 
 
 def entry_risk(panel):
-    result = {}
+    out = {}
     for symbol, df in panel.items():
-        if symbol in PV:
-            result[symbol] = _one(df, PV[symbol])[1]
+        if symbol in SYMS:
+            out[symbol] = _one(df, SYMS[symbol])[1]
         else:
-            result[symbol] = np.zeros(len(df))
-    return result
+            out[symbol] = np.zeros(len(df))
+    return out
